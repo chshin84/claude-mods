@@ -1,0 +1,8 @@
+{
+  "name": "chshin-mods",
+  "owner": { "name": "chshin84" },
+  "plugins": [
+    { "name": "glossary", "source": "./glossary", "description": "대화에 나온 어려운 용어를 4줄 이하로 풀어 오른쪽 패널에 보인다" },
+    { "name": "statusline", "source": "./statusline", "description": "모델 | 저장소 | ctx | 5h | 7d | 개발 단계를 색과 날씨 아이콘으로 보이는 상태 표시줄" }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "name": "statusline",
+  "version": "0.1.0",
+  "description": "모델 | 저장소(없으면 폴더) | ctx | 5h | 7d | 개발 단계를 색과 날씨 아이콘으로 보이는 상태 표시줄"
+}

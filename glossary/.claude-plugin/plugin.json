@@ -1,0 +1,6 @@
+{
+  "name": "glossary",
+  "version": "0.1.0",
+  "description": "이 대화에 나온 어려운 용어를 사무직 직원도 알 수 있게 4줄 이하로 풀어 오른쪽 패널에 보인다",
+  "types": "./types/index.d.ts"
+}

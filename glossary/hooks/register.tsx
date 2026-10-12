@@ -3,14 +3,11 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Term } from '../types'
 
-const PANE = 'glossary'
 const COMMAND = '/단어'
-const TITLE = '단어 사전'
-const MAX_LINES = 4
 
 const terms = atom({ plugin: 'glossary', key: 'terms' } as const, [])
 const isOn = atom({ plugin: 'glossary', key: 'isOn' } as const, true)
-const status = atom({ plugin: 'glossary', key: 'status' } as const, '')
+const opened = atom({ plugin: 'glossary', key: 'opened' } as const, [])
 
 const SYSTEM = `You keep a glossary for an office worker in finance who does not write software. They read reports daily but do not know developer vocabulary: even "commit", "push", "branch", "repository", "local", "remote", "hook", "plugin", "JSON" are unfamiliar to them.
 From the recent conversation, pick the terms this reader would not understand:
@@ -18,26 +15,15 @@ From the recent conversation, pick the terms this reader would not understand:
 - names that only mean something inside this project or session: file, folder, function, skill, command and mod names, and labels or abbreviations the assistant coined;
 - English words or acronyms left untranslated.
 Skip terms already in the glossary and everyday business words.
-Explain each in Korean formal written style (~다 체), at most two short sentences and 80 Korean characters, saying what it is and what it does here. Do not use analogies.
+Write for someone who has never seen this vocabulary: plain everyday Korean words, short sentences, no other jargon inside the explanation (if one is unavoidable, explain it on the spot). Use Korean formal written style (~다 체). Do not use analogies.
+For each term write two explanations:
+- "desc": at most 100 Korean characters, what it is and what it does here.
+- "detail": at most 250 Korean characters, a fuller explanation: what it is, why it is used, what it did in this conversation, and a concrete example of it in use starting with "예:" when one helps.
 Answer with a JSON object only, no prose:
-{"terms": [{"term": "<the term as it appeared>", "desc": "<the explanation>"}]}
+{"terms": [{"term": "<the term as it appeared>", "desc": "<the short explanation>", "detail": "<the full explanation>"}]}
 At most 6 terms, the most important first. If none qualifies, answer an empty terms array.`
 
 const clip = (text: string, size: number) => (text.length > size ? `${text.slice(0, size)}…` : text)
-
-// Cuts text to what `lines` rows of `columns` cells hold, a wide (Hangul, CJK) character taking two cells.
-const fit = (text: string, columns: number, lines: number) => {
-  const room = Math.max(1, columns) * lines
-  let used = 0
-  let out = ''
-  for (const char of text) {
-    const width = /[ᄀ-ᇿ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/.test(char) ? 2 : 1
-    if (used + width > room - 1) return `${out}…`
-    used += width
-    out += char
-  }
-  return out
-}
 
 const key = (term: string) => term.trim().toLowerCase()
 
@@ -48,7 +34,7 @@ const parse = (reply: string, known: Set<string>): Term[] => {
     if (!Array.isArray(list)) return []
     return list
       .filter((one): one is Term => typeof one?.term === 'string' && typeof one?.desc === 'string')
-      .map(one => ({ term: one.term.trim(), desc: one.desc.trim() }))
+      .map(one => ({ term: one.term.trim(), desc: one.desc.trim(), ...(typeof one.detail === 'string' && one.detail.trim() !== '' && { detail: one.detail.trim() }) }))
       .filter(one => {
         const name = key(one.term)
         if (name === '' || known.has(name)) return false
@@ -60,49 +46,43 @@ const parse = (reply: string, known: Set<string>): Term[] => {
   }
 }
 
-// Puts the new terms first, then the held terms the latest turn mentions again, then the rest.
-const reorder = (list: Term[], found: Term[], turn: string) => {
-  const text = turn.toLowerCase()
-  const seen = list.filter(one => text.includes(key(one.term)))
-  return [...found, ...seen, ...list.filter(one => !seen.includes(one))]
+// Code and inline code, whose words are not the reader's prose.
+const CODE = /```[\s\S]*?(?:```|$)|`[^`\n]*`/g
+const CARD_WIDTH = 44
+const DETAIL_WIDTH = 72
+// The card's own colours, solid so nothing beneath shows through, and legible under a dark or a light theme.
+const CARD = { background: '#2d2d2d', text: '#f0f0f0', title: '#7ab4ff' }
+
+// The glossary's terms this text mentions outside code, in the order they first appear.
+const mentioned = (text: string, list: Term[]) => {
+  const prose = text.replace(CODE, ' ').toLowerCase()
+  return list
+    .map(one => ({ one, at: prose.indexOf(key(one.term)) }))
+    .filter(({ one, at }) => at !== -1 && key(one.term) !== '')
+    .sort((a, b) => a.at - b.at)
+    .map(({ one }) => one)
 }
 
 async function collect($: EngineInterface) {
   const held = await read($, terms)
-  const messages = await $.session.messages()
-  const recent = messages.slice(-6)
-  const asked = messages.map(message => message.role).lastIndexOf('user')
-  const turn = messages.slice(Math.max(0, asked)).map(message => message.text).join('\n')
+  const recent = (await $.session.messages()).slice(-6)
   const transcript = recent.map(message => `${message.role}: ${clip(message.text, 2000)}`).join('\n')
   const reply = await $.model.complete({
     model: 'claude-haiku-5-5',
     system: SYSTEM,
     prompt: `Already in the glossary: ${held.map(one => one.term).join(', ') || '(none)'}\n\nRecent conversation:\n${transcript}`,
-    maxTokens: 1200,
+    maxTokens: 3000,
   })
-  if (!reply.isAnswered) {
-    await update($, status, () => `용어를 받지 못했습니다(${reply.reason}).`)
-    return
-  }
+  if (!reply.isAnswered) return
   const found = parse(reply.text, new Set(held.map(one => key(one.term))))
-  await update($, terms, list => reorder(list, found, turn))
-  // The pane pops up with the session's first explained terms, not at session start.
-  if (held.length === 0 && found.length > 0 && (await read($, isOn))) await open($)
-  await update($, status, () => '')
+  if (found.length > 0) await update($, terms, list => [...list, ...found])
 }
 
-const open = ($: EngineInterface) => $.ui.open({ id: PANE, title: TITLE }).catch(() => ({ isPlaced: false }))
-
-// Shows or hides the pane; collecting goes on either way.
+// Shows or hides the term rows under replies; collecting goes on either way.
 async function toggle($: EngineInterface) {
-  if (await read($, isOn)) {
-    await update($, isOn, () => false)
-    await $.ui.close({ id: PANE }).catch(() => undefined)
-    return '단어 사전을 숨겼습니다.'
-  }
-  await update($, isOn, () => true)
-  const opened = await open($)
-  return opened.isPlaced ? '단어 사전을 열었습니다.' : '단어 사전을 켰지만 터미널이 좁아 패널을 놓지 못했습니다.'
+  const shown = !(await read($, isOn))
+  await update($, isOn, () => shown)
+  return shown ? '답변 아래 용어 줄을 켰습니다.' : '답변 아래 용어 줄을 껐습니다.'
 }
 
 export const register: Register = on => {
@@ -116,13 +96,7 @@ export const register: Register = on => {
   on('prompt.autocomplete', { token: /^\// }, async ($, e, next) => {
     const rows = await next(e)
     if (e.start !== 0 || !COMMAND.startsWith(e.token)) return rows
-    return { suggestions: [...rows.suggestions, { text: COMMAND, description: '단어 사전 패널을 열거나 숨긴다' }] }
-  })
-
-  // Closing the pane by hand turns the glossary off; collecting goes on regardless.
-  on('ui.close', async ($, e, next) => {
-    if (e.id === PANE && e.origin.kind === 'person') await update($, isOn, () => false).catch(() => undefined)
-    return next(e)
+    return { suggestions: [...rows.suggestions, { text: COMMAND, description: '답변 아래 용어 줄을 켜거나 끈다' }] }
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -131,30 +105,78 @@ export const register: Register = on => {
     return done
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
-    const list = await read($, terms)
-    const note = await read($, status)
-    const columns = e.props.bodyColumns
-
+  // Under a reply, a row of the terms it mentions; the pointer on one lights it and shows its short explanation in a card above,
+  // and a click opens the full explanation in a larger box under the row until it is clicked again.
+  // Only the fullscreen layout follows the pointer and reports clicks.
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    if (e.viewport?.isFullscreen !== true || e.props.isSummary || !(await read($, isOn))) return next(e)
+    const list = mentioned(e.props.text, await read($, terms))
+    if (list.length === 0) return next(e)
+    const open = await read($, opened)
+    const { Box, Text, Button, Markdown } = $.ui.resolve(e)
+    const width = Math.max(20, Math.min(CARD_WIDTH, e.viewport.columns - 4))
+    const wide = Math.max(20, Math.min(DETAIL_WIDTH, e.viewport.columns - 4))
+    const flip = (name: string) => update($, opened, names => (names.includes(name) ? names.filter(one => one !== name) : [...names, name]))
     return (
-      <Box flexDirection="column">
-        {note !== '' && (
-          <Box marginBottom={1}>
-            <Text color="inactive" italic>
-              {note}
-            </Text>
+      <Box flexDirection="row">
+        <Text>{e.props.isFirstOfReply ? '● ' : '  '}</Text>
+        <Box flexDirection="column" flexShrink={1}>
+          <Markdown text={e.props.text} />
+          <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1}>
+            <Text color="inactive">용어</Text>
+            {list.map(one => (
+              <Box key={`chip-${key(one.term)}`}>
+                <Button key={`press-${key(one.term)}`} label={one.term} plain onPress={() => void flip(key(one.term))}>
+                  <Text color="suggestion" underline>
+                    {one.term}
+                  </Text>
+                </Button>
+                <Box
+                  position="absolute"
+                  bottom={1}
+                  left={0}
+                  width={width}
+                  display="none"
+                  hover={{ display: 'flex' }}
+                  borderStyle="round"
+                  borderColor={CARD.title}
+                  backgroundColor={CARD.background}
+                  paddingX={1}
+                  flexDirection="column"
+                >
+                  <Text bold color={CARD.title} backgroundColor={CARD.background}>
+                    {one.term}
+                  </Text>
+                  <Text color={CARD.text} backgroundColor={CARD.background}>
+                    {one.desc}
+                  </Text>
+                  <Text dimColor backgroundColor={CARD.background}>
+                    누르면 자세히 봅니다
+                  </Text>
+                </Box>
+              </Box>
+            ))}
           </Box>
-        )}
-        {list.length === 0 && note === '' && <Text color="inactive">아직 풀이할 용어가 없습니다.</Text>}
-        {list.map(one => (
-          <Box key={`term-${key(one.term)}`} flexDirection="column" marginBottom={1}>
-            <Text bold wrap="truncate-end">
-              {one.term}
-            </Text>
-            <Text color="inactive">{fit(one.desc, columns, MAX_LINES)}</Text>
-          </Box>
-        ))}
+          {list
+            .filter(one => open.includes(key(one.term)))
+            .map(one => (
+              <Box
+                key={`detail-${key(one.term)}`}
+                width={wide}
+                marginTop={1}
+                borderStyle="round"
+                borderColor={CARD.title}
+                paddingX={1}
+                flexDirection="column"
+              >
+                <Text bold color={CARD.title}>
+                  {one.term}
+                </Text>
+                <Text>{one.detail ?? one.desc}</Text>
+                <Text color="inactive">용어를 다시 누르면 닫힙니다</Text>
+              </Box>
+            ))}
+        </Box>
       </Box>
     )
   })

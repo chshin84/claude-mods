@@ -1,4 +1,4 @@
-// Claude Code 상태 표시줄: 모델 | 저장소(없으면 폴더) | ctx | 5h | 7d | 개발 단계
+// Claude Code 상태 표시줄: [ 워크트리·폴더 | 개발 단계(있으면) | 5시간한도 | 주간한도 | 컨텍스트 | 모델 ]
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -18,6 +18,13 @@ function gauge(label, pct) {
   if (typeof pct !== 'number') return `${label} -`;
   const [, color, icon] = LEVELS.find(([max]) => pct < max);
   return `${color}${label} ${icon} ${Math.round(pct)}%${RESET}`;
+}
+
+// 작업 위치: 워크트리 이름, 없으면 저장소(없으면 폴더) 이름
+function place(input) {
+  const tree = input.worktree?.name ?? input.workspace?.git_worktree;
+  if (tree) return `워크트리:${tree}`;
+  return `폴더:${repoName(input.workspace?.current_dir ?? input.cwd)}`;
 }
 
 function repoName(dir) {
@@ -67,12 +74,11 @@ function phase(transcript) {
 
 const rl = input.rate_limits || {};
 const parts = [
-  input.model?.display_name ?? '',
-  repoName(input.workspace?.current_dir ?? input.cwd),
-  gauge('ctx', input.context_window?.used_percentage),
-  gauge('5h', rl.five_hour?.used_percentage),
-  gauge('7d', rl.seven_day?.used_percentage),
-];
-const p = phase(input.transcript_path);
-if (p) parts.push(`▶ ${p}`);
-process.stdout.write(parts.join(' | '));
+  place(input),
+  phase(input.transcript_path),
+  gauge('5시간한도', rl.five_hour?.used_percentage),
+  gauge('주간한도', rl.seven_day?.used_percentage),
+  gauge('컨텍스트', input.context_window?.used_percentage),
+  `모델:${input.model?.display_name ?? ''}`,
+].filter(Boolean);
+process.stdout.write(`[ ${parts.join(' | ')} ]`);

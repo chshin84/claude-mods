@@ -1,4 +1,4 @@
-// Claude Code 상태 표시줄: [ 워크트리·폴더 | 개발 단계(있으면) | 5시간한도 | 주간한도 | 컨텍스트 | 모델 ]
+// Claude Code 상태 표시줄: [ 워크트리·폴더 | 개발 단계(없으면 움직이는 Claude 캐릭터) | 5시간한도 | 주간한도 | 컨텍스트 | 모델 ]
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -72,10 +72,20 @@ function phase(transcript) {
   return last;
 }
 
+// 개발 단계가 없는 평시 작업이면 Claude Code 로고 ✻ 를 그려, 1초마다 좌우로 한 칸씩 걷게 한다.
+// 설정의 refreshInterval 이 1초마다 다시 그리게 한다.
+const STEPS = [0, 1, 2, 1];
+const CLAUDE = '\x1b[38;2;217;119;87m';
+
+function idle() {
+  const step = STEPS[Math.floor(Date.now() / 1000) % STEPS.length];
+  return `${' '.repeat(step)}${CLAUDE}✻${RESET}${' '.repeat(2 - step)} `;
+}
+
 const rl = input.rate_limits || {};
 const parts = [
   place(input),
-  phase(input.transcript_path),
+  phase(input.transcript_path) || idle(),
   gauge('5시간한도', rl.five_hour?.used_percentage),
   gauge('주간한도', rl.seven_day?.used_percentage),
   gauge('컨텍스트', input.context_window?.used_percentage),

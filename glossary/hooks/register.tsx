@@ -5,7 +5,9 @@ import type { Term } from '../types'
 
 const COMMAND = '/단어'
 
+// Two tracks: the terms the model chose, and the terms the person asked about.
 const terms = atom({ plugin: 'glossary', key: 'terms' } as const, [])
+const asked = atom({ plugin: 'glossary', key: 'asked' } as const, [])
 const isOn = atom({ plugin: 'glossary', key: 'isOn' } as const, true)
 const opened = atom({ plugin: 'glossary', key: 'opened' } as const, [])
 
@@ -15,6 +17,8 @@ From the recent conversation, pick the terms this reader would not understand:
 - names that only mean something inside this project or session: file, folder, function, skill, command and mod names, and labels or abbreviations the assistant coined;
 - English words or acronyms left untranslated.
 Skip terms already in the glossary and everyday business words.
+Pick only terms that stand in the assistant's own prose: not only in the user's messages, inside code (\`...\` or fenced blocks), tables or headings, where they cannot be marked.
+One exception: a term the user asked about in their own message (what it means, what it does) is always picked, marked "asked": true, even when only their message holds it or it is listed under "Already in the glossary"; skip a term listed under "Already asked about".
 Write for someone who has never seen this vocabulary: plain everyday Korean words, short sentences, no other jargon inside the explanation (if one is unavoidable, explain it on the spot). Use Korean formal written style (~다 체). Do not use analogies.
 For each term write two explanations:
 - "desc": at most 100 Korean characters, what it is and what it does here.
@@ -22,31 +26,69 @@ For each term write two explanations:
   Add a concrete example of it in use, starting with "예:", only for a general concept the reader will meet again elsewhere (such as "plugin", "commit", "branch").
   Give no example for a proper noun or a name (a product, service, company, file, folder, function, skill, command or mod name), nor for a setting, mode or option value (such as "fullscreen").
 Answer with a JSON object only, no prose:
-{"terms": [{"term": "<the term as it appeared>", "desc": "<the short explanation>", "detail": "<the full explanation>"}]}
+{"terms": [{"term": "<the term as it appeared>", "desc": "<the short explanation>", "detail": "<the full explanation>", "asked": <true only for a term the user asked about>}]}
 At most 6 terms, the most important first. If none qualifies, answer an empty terms array.`
 
 const clip = (text: string, size: number) => (text.length > size ? `${text.slice(0, size)}…` : text)
 
 const key = (term: string) => term.trim().toLowerCase()
 
-// The model's reply as new terms: only well-formed ones the glossary does not hold yet.
-const parse = (reply: string, known: Set<string>): Term[] => {
+const LETTER = /[\p{L}\p{N}_]/u
+// What joins a file name, a path or a hyphenated name into one word: `SKILL.md`, `origin/main`, `claude-mods`.
+const JOINER = /[./\\\-_:#@]/
+// What a term may carry glued after it: a Korean particle, the copula 이다, the ending of 하다 or 되다, or the suffix
+// 들, 별, 당 or 용.
+const TAIL = /^(?:은|는|이|입|인|일|임|였|가|을|를|의|에|에서|에게|으로|로|와|과|도|만|까지|부터|보다|처럼|마다|나|란|라|하|합|했|한|할|해|되|됩|됐|된|될|돼|들|별|당|용)/
+
+// Where a term first stands in a text as a whole word, -1 when nowhere: no letter or joiner right before it, and right
+// after it no letter but one of the tails above, and no joiner leading on to more of the name. A term written in
+// capitals, such as READ, skips the word spelled all in lower case, such as the verb read.
+// A caller placing many terms in one text passes its lower case once.
+const place = (text: string, term: Term, lower = text.toLowerCase()) => {
+  const name = key(term.term)
+  if (name === '') return -1
+  const isCapital = term.term.trim() === term.term.trim().toUpperCase() && /[A-Z]/.test(term.term)
+  for (let at = lower.indexOf(name); at !== -1; at = lower.indexOf(name, at + 1)) {
+    const before = text[at - 1] ?? ''
+    const after = text.slice(at + name.length)
+    const written = text.slice(at, at + name.length)
+    if (LETTER.test(before) || JOINER.test(before)) continue
+    if (JOINER.test(after[0] ?? '') && LETTER.test(after[1] ?? '')) continue
+    if (isCapital && written === written.toLowerCase()) continue
+    if (!LETTER.test(after[0] ?? '') || (/^[가-힣]/.test(after) && TAIL.test(after))) return at
+  }
+  return -1
+}
+
+type Found = Term & { isAsked: boolean }
+
+// The model's reply as well-formed terms, each once, with whether the person asked about it; undefined when the reply is
+// not the JSON asked for.
+const parse = (reply: string): Found[] | undefined => {
   try {
     const list: unknown = JSON.parse(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1))?.terms
-    if (!Array.isArray(list)) return []
+    if (!Array.isArray(list)) return undefined
+    const seen = new Set<string>()
     return list
-      .filter((one): one is Term => typeof one?.term === 'string' && typeof one?.desc === 'string')
-      .map(one => ({ term: one.term.trim(), desc: one.desc.trim(), ...(typeof one.detail === 'string' && one.detail.trim() !== '' && { detail: one.detail.trim() }) }))
+      .filter((one): one is Term & { asked?: unknown } => typeof one?.term === 'string' && typeof one?.desc === 'string')
+      .map(one => ({
+        term: one.term.trim(),
+        desc: one.desc.trim(),
+        ...(typeof one.detail === 'string' && one.detail.trim() !== '' && { detail: one.detail.trim() }),
+        isAsked: one.asked === true,
+      }))
       .filter(one => {
         const name = key(one.term)
-        if (name === '' || known.has(name)) return false
-        known.add(name)
+        if (name === '' || seen.has(name)) return false
+        seen.add(name)
         return true
       })
   } catch {
-    return []
+    return undefined
   }
 }
+
+const bare = ({ isAsked: _, ...one }: Found): Term => one
 
 // Code and inline code, whose words are not the reader's prose.
 const CODE = /```[\s\S]*?(?:```|$)|`[^`\n]*`/g
@@ -105,10 +147,11 @@ const wrap = (text: string, width: number) => {
 
 // The glossary's terms this text mentions outside code, in the order they first appear.
 const mentioned = (text: string, list: Term[]) => {
-  const prose = text.replace(CODE, ' ').toLowerCase()
+  const prose = text.replace(CODE, ' ')
+  const lower = prose.toLowerCase()
   return list
-    .map(one => ({ one, at: prose.indexOf(key(one.term)) }))
-    .filter(({ one, at }) => at !== -1 && key(one.term) !== '')
+    .map(one => ({ one, at: place(prose, one, lower) }))
+    .filter(({ at }) => at !== -1)
     .sort((a, b) => a.at - b.at)
     .map(({ one }) => one)
 }
@@ -121,11 +164,11 @@ const tag = (text: string) => {
 }
 
 // A run of a line's text with its inline style, and the term it spells if it spells one.
-type Piece = { text: string; bold?: boolean; code?: boolean; link?: boolean; term?: Term }
+type Piece = { text: string; bold?: boolean; code?: boolean; href?: string; term?: Term }
 
 // Lines only the engine's markdown draws well: fences, headings, tables, quotes and rules.
 const STRUCTURED = /^\s*(```|#|\||>|---|\*\*\*)/
-const INLINE = /`[^`\n]*`|\*\*[^*\n]+\*\*|\[([^\]\n]+)\]\([^)\s]+\)/g
+const INLINE = /`[^`\n]*`|\*\*[^*\n]+\*\*|\[([^\]\n]+)\]\(([^)\s]+)\)|https?:\/\/[^\s)]+/g
 const BULLET = /^(\s*)[-*+]\s+/
 
 // The reply's lines cut at blank lines, a fenced block kept whole.
@@ -154,22 +197,24 @@ const styled = (line: string): Piece[] => {
     if (match.index > at) out.push({ text: line.slice(at, match.index) })
     const found = match[0]
     if (found.startsWith('`')) out.push({ text: found.slice(1, -1), code: true })
+    // Bold code, **`name`**, is code drawn bold.
+    else if (/^\*\*`[^`]*`\*\*$/.test(found)) out.push({ text: found.slice(3, -3), bold: true, code: true })
     else if (found.startsWith('**')) out.push({ text: found.slice(2, -2), bold: true })
-    else out.push({ text: match[1] ?? found, link: true })
+    else out.push({ text: match[1] ?? found, href: match[2] ?? found })
     at = match.index + found.length
   }
   if (at < line.length) out.push({ text: line.slice(at) })
   return out
 }
 
-// A run cut around the glossary's terms in it, earliest first and the longer of two at one place; code stays whole.
+// A run cut around the glossary's terms in it, earliest first and the longer of two at one place; code and links stay whole.
 const marked = (piece: Piece, list: Term[]): Piece[] => {
   if (piece.text === '') return []
-  if (piece.code) return [piece]
+  if (piece.code || piece.href !== undefined) return [piece]
   const lower = piece.text.toLowerCase()
   const hit = list
-    .map(one => ({ one, at: lower.indexOf(key(one.term)) }))
-    .filter(({ one, at }) => at !== -1 && key(one.term) !== '')
+    .map(one => ({ one, at: place(piece.text, one, lower) }))
+    .filter(({ at }) => at !== -1)
     .sort((a, b) => a.at - b.at || key(b.one.term).length - key(a.one.term).length)[0]
   if (hit === undefined) return [piece]
   const end = hit.at + key(hit.one.term).length
@@ -180,12 +225,13 @@ const marked = (piece: Piece, list: Term[]): Piece[] => {
   ]
 }
 
-// Runs regrouped into the words a space separates, so a line wraps between words.
+// Runs regrouped into the words a space separates, so a line wraps between words; a term of several words stays one
+// word, its underline running across its spaces.
 const words = (pieces: Piece[]) => {
   const out: Piece[][] = []
   let current: Piece[] = []
   for (const piece of pieces) {
-    piece.text.split(' ').forEach((part, index) => {
+    ;(piece.term === undefined ? piece.text.split(' ') : [piece.text]).forEach((part, index) => {
       if (index > 0 && current.length > 0) {
         out.push(current)
         current = []
@@ -205,20 +251,94 @@ const lineOf = (line: string, list: Term[]) => {
   return { prefix: `${indent}${bullet ? '• ' : ''}`, words: words(styled(body).flatMap(piece => marked(piece, list))) }
 }
 
-async function collect($: EngineInterface) {
-  const held = await read($, terms)
-  const recent = (await $.session.messages()).slice(-6)
-  const transcript = recent.map(message => `${message.role}: ${clip(message.text, 2000)}`).join('\n')
+// The reply's room: most of it goes to the model's thinking. Explaining six terms alone took up to 13,535 tokens, and
+// this call picks them as well; only what is written is paid for.
+const MAX_TOKENS = 32_000
+
+// The longest a call may take: the slowest measured took 55 seconds, and a call that never answers holds up the queue.
+const TIMEOUT_MS = 120_000
+
+type Message = { role: string; text: string }
+
+// A user-role message the person did not type: a skill's body, a hook's or another session's message, an interruption
+// notice, or a tagged system block.
+const NOT_THEIRS = /^\s*(?:<|\[Request interrupted|Base directory for this skill|Another Claude session|Stop hook feedback|Caveat:|This session is being continued from a previous conversation)/
+
+// The person's message as the call sees it: its start and its end, where a question after a long paste stands.
+const theirsClipped = (text: string) => (text.length > 2000 ? `${text.slice(0, 1000)}…${text.slice(-1000)}` : text)
+
+const holds = (list: Term[]) => new Set(list.map(one => key(one.term)))
+
+// Whether the person's lower-cased words hold the term, as they type it: anywhere for a term with Hangul, and for an
+// English one only as a word of its own, so PR is not found inside "prompt".
+const asksAbout = (theirs: string, term: Term) => {
+  const name = key(term.term)
+  if (name === '') return false
+  if (/[^\x00-\x7f]/.test(name)) return theirs.includes(name)
+  for (let at = theirs.indexOf(name); at !== -1; at = theirs.indexOf(name, at + 1)) {
+    if (!/[a-z0-9]/.test(theirs[at - 1] ?? '') && !/[a-z0-9]/.test(theirs[at + name.length] ?? '')) return true
+  }
+  return false
+}
+
+// Both tracks as one glossary, an asked term first and once.
+async function glossary($: EngineInterface) {
+  const askedHeld = await read($, asked)
+  const askedNames = holds(askedHeld)
+  return { askedHeld, chosen: (await read($, terms)).filter(one => !askedNames.has(key(one.term))) }
+}
+
+// Whether a reply would underline the term: the drawing's own path, blocks the engine draws itself left out.
+const shows = (text: string, term: Term) =>
+  blocks(text)
+    .filter(lines => !lines.some(line => STRUCTURED.test(line)))
+    .some(lines => lines.some(line => lineOf(line, [term]).words.some(word => word.some(piece => piece.term !== undefined))))
+
+// One collection, on the conversation as it stood when its turn ended. Held terms are never let go: the call names only
+// those its conversation mentions, so it stays a few thousand tokens long however many the session holds, far inside
+// Claude Haiku 5.5's lowest price tier (100K input tokens).
+async function collect($: EngineInterface, recent: Message[]) {
+  const transcript = recent.map(message => `${message.role}: ${message.role === 'user' ? theirsClipped(message.text) : clip(message.text, 2000)}`).join('\n')
+  const { askedHeld, chosen } = await glossary($)
+  const lower = transcript.toLowerCase()
+  const named = (list: Term[], isIn: (one: Term) => boolean) => list.filter(isIn).map(one => one.term).join(', ') || '(none)'
   const reply = await $.model.complete({
     model: 'claude-haiku-5-5',
     system: SYSTEM,
-    prompt: `Already in the glossary: ${held.map(one => one.term).join(', ') || '(none)'}\n\nRecent conversation:\n${transcript}`,
-    maxTokens: 3000,
+    prompt: `Already asked about: ${named(askedHeld, one => asksAbout(lower, one))}\nAlready in the glossary: ${named(chosen, one => place(transcript, one, lower) !== -1)}\n\nRecent conversation:\n${transcript}`,
+    maxTokens: MAX_TOKENS,
+    timeoutMs: TIMEOUT_MS,
   })
-  if (!reply.isAnswered) return
-  const found = parse(reply.text, new Set(held.map(one => key(one.term))))
-  if (found.length > 0) await update($, terms, list => [...list, ...found])
+  if (!reply.isAnswered) return $.ui.status(`단어 사전: 용어를 받지 못했습니다(${reply.reason}).`)
+  if (reply.usage.output_tokens >= MAX_TOKENS) return $.ui.status('단어 사전: 응답이 잘려 용어를 저장하지 못했습니다.')
+  const found = parse(reply.text)
+  if (found === undefined) return $.ui.status('단어 사전: 응답을 읽지 못했습니다.')
+  $.ui.status(undefined)
+  // An asked term counts where the person's own words hold it, loosely, as they type; a chosen one, only where a reply
+  // underlines it.
+  const theirs = recent
+    .filter(message => message.role === 'user')
+    .map(message => theirsClipped(message.text).toLowerCase())
+    .join('\n')
+  const replies = recent.filter(message => message.role === 'assistant')
+  const askedNew = found.filter(one => one.isAsked && asksAbout(theirs, one) && !holds(askedHeld).has(key(one.term))).map(bare)
+  const moved = holds(askedNew)
+  const known = holds([...askedHeld, ...chosen])
+  const chosenNew = found
+    .filter(one => !moved.has(key(one.term)) && !known.has(key(one.term)) && replies.some(message => shows(message.text, one)))
+    .map(bare)
+  // Collections run one at a time, so the lists read above are the lists now; nothing new, nothing written or redrawn.
+  if (askedNew.length > 0) {
+    await update($, asked, list => [...list, ...askedNew])
+    if (chosen.some(one => moved.has(key(one.term)))) await update($, terms, list => list.filter(one => !moved.has(key(one.term))))
+  }
+  if (chosenNew.length > 0) await update($, terms, list => [...list, ...chosenNew])
 }
+
+// Collections waiting their turn, run one after another, and the session they belong to: a /clear moves on to the next,
+// and the collections of the one before are let go.
+let queue: Promise<unknown> = Promise.resolve()
+let era = 0
 
 // Shows or hides the terms marked in replies; collecting goes on either way.
 async function toggle($: EngineInterface) {
@@ -243,8 +363,28 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId === undefined && !e.isAborted) void collect($).catch(() => undefined)
+    if (e.agentId === undefined && !e.isAborted) {
+      // The conversation is taken now, as this turn ended, though its collection may wait behind earlier ones; only the
+      // last six messages the person or the assistant wrote are kept.
+      const written = (await $.session.messages())
+        .filter(message => message.text !== '' && !(message.role === 'user' && NOT_THEIRS.test(message.text)))
+        .map(({ role, text }) => ({ role, text }))
+      // A turn of many tool steps fills six messages with the assistant's own; the person's last message stays first.
+      const asking = written.findLast(message => message.role === 'user')
+      const last = written.slice(-6)
+      const recent = asking === undefined || last.includes(asking) ? last : [asking, ...written.slice(-5)]
+      const mine = era
+      queue = queue
+        .then(() => (mine === era ? collect($, recent) : undefined))
+        .catch(() => $.ui.status('단어 사전: 용어 수집 중 오류가 났습니다.'))
+        .catch(() => undefined)
+    }
     return done
+  })
+
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') era += 1
+    return next(e)
   })
 
   // A click on a term's word widens its card to the full explanation and a second click narrows it;
@@ -261,11 +401,12 @@ export const register: Register = on => {
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     // Only the terminal draws a `Client`, which reports the click and the pointer leaving a word.
     if (e.surface !== 'terminal' || e.viewport?.isFullscreen !== true || e.props.isSummary || !(await read($, isOn))) return next(e)
-    const list = mentioned(e.props.text, await read($, terms))
+    const { askedHeld, chosen } = await glossary($)
+    const list = mentioned(e.props.text, [...askedHeld, ...chosen])
     if (list.length === 0) return next(e)
     const open = await read($, opened)
     const id = tag(e.props.text)
-    const { Box, Text, Markdown, Client } = $.ui.resolve(e)
+    const { Box, Text, Markdown, Client, Link } = $.ui.resolve(e)
     // The columns the reply's text takes, past the bullet gutter.
     const columns = Math.max(20, e.viewport.columns - 2)
     // Which of the message's rows the viewport shows; absent, the whole message is taken as shown.
@@ -324,8 +465,8 @@ export const register: Register = on => {
     const floating: JSX.Element[] = []
     const piece = (one: Piece, place: string) =>
       one.term === undefined ? (
-        <Text bold={one.bold} underline={one.link} color={one.code ? 'permission' : undefined}>
-          {one.text}
+        <Text bold={one.bold} color={one.code ? 'permission' : undefined}>
+          {one.href === undefined ? one.text : <Link href={one.href}>{one.text}</Link>}
         </Text>
       ) : (
         <Client key={`term-${place}`} module="./term.tsx" props={{ text: one.text, bold: one.bold === true, color: TERM }} />
